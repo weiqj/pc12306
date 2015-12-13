@@ -176,16 +176,41 @@ static bool volatile terminated2 = false;
 static ClientReq			clientReqs[CLIENT_REQ_SIZE];
 static uint64_t volatile	clientReqPos;
 
-static void *iohandler(void *) {
+static void iohandler(void *) {
 	typedef vector<ClientSession *> Sessions;
+	int _fdListen = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+	if (_fdListen < 0)
+		throw std::runtime_error("SRServerScheduler: Socket");
+	int optval = 1;
+	setsockopt(_fdListen, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+	sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_port = htons(PORT);
+	if (::bind(_fdListen, (const sockaddr *)(&addr), sizeof(sockaddr_in)) < 0)
+		throw std::runtime_error("SRServerScheduler: Bind");
+	int flags = fcntl(_fdListen, F_GETFL, 0);
+	fcntl(_fdListen, F_SETFL, flags | O_NONBLOCK);
+	if (listen(_fdListen, 10) < 0)
+		throw std::runtime_error("SRServerScheduler: Listen");
 	while (!terminatePocess) {
+		sockaddr_in addr;
+		socklen_t addrlen = (socklen_t)sizeof(sockaddr_in);
+		int fd = accept(_fdListen, (sockaddr *)&addr, &addrlen);
+		if (fd < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				// ignore
+			} else {
+				printf("Error accepting socket.\n");
+			}
+		} else {
 
+		}
 	}
 	terminated1 = true;
-	return NULL;
 }
 
-static void *tickethandler(void *) {
+static void tickethandler(void *) {
 	uint64_t curPos = 0;
 	while (!terminatePocess) {
 		while (curPos < clientReqPos) {
@@ -212,7 +237,6 @@ static void *tickethandler(void *) {
 		}
 	}
 	terminated2 = true;
-	return NULL;
 }
 
 int main(int argc, char* argv[]) {
@@ -222,8 +246,12 @@ int main(int argc, char* argv[]) {
 		trains[i] = new TrainTicketMap();
 		trains[i]->initTickets(ticketPool);
 	}
-	test1();
-	benchmark();
+	//test1();
+	//benchmark();
+	createThreadStd(&iohandler, NULL);
+	for (;;) {
+		sleep(1000);
+	}
 	return 0;
 }
 

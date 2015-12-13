@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -123,6 +124,12 @@ public:
 	ClientSession(int fd) : _fd(fd), _reqPos(0), _respPos(0), _respSent(0) {
 		int flags = fcntl(_fd, F_GETFL, 0);
 		fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
+		flags = 1;
+        setsockopt(_fd,            /* socket affected */
+			IPPROTO_TCP,     /* set option at TCP level */
+			TCP_NODELAY,     /* name of option */
+			(char *)&flags,  /* the cast is historical cruft */
+			sizeof(int));    /* length of option value */
 	}
 
 	inline ssize_t read(uint8_t *buffer, size_t length) {
