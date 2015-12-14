@@ -59,6 +59,14 @@ static size_t nSearches = 0;
 typedef vector<SearchOffsets> Offsets;
 static Offsets offsets;
 static TicketPool *ticketPool = NULL;
+static bool volatile terminatePocess = false;
+static bool volatile terminated1 = false;
+static bool volatile terminated2 = false;
+
+#define CLIENT_REQ_SIZE	MAX_CONN*NET_QUEUE_SIZE
+
+static ClientReq			clientReqs[CLIENT_REQ_SIZE];
+static uint64_t volatile	clientReqPos;
 
 static void generateSearchPatterns() {
 	offsets.clear();
@@ -167,17 +175,9 @@ static void benchmark() {
 	printf("Total time = %f\n", t2 - t1);
 }
 
-static bool volatile terminatePocess = false;
-static bool volatile terminated1 = false;
-static bool volatile terminated2 = false;
-
-#define CLIENT_REQ_SIZE	1024*1024
-
-static ClientReq			clientReqs[CLIENT_REQ_SIZE];
-static uint64_t volatile	clientReqPos;
-
 static void iohandler(void *) {
 	typedef vector<ClientSession *> Sessions;
+	Sessions sessions;
 	int _fdListen = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
 	if (_fdListen < 0)
 		throw std::runtime_error("SRServerScheduler: Socket");
@@ -194,17 +194,52 @@ static void iohandler(void *) {
 	if (listen(_fdListen, 10) < 0)
 		throw std::runtime_error("SRServerScheduler: Listen");
 	while (!terminatePocess) {
-		sockaddr_in addr;
-		socklen_t addrlen = (socklen_t)sizeof(sockaddr_in);
-		int fd = accept(_fdListen, (sockaddr *)&addr, &addrlen);
-		if (fd < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				// ignore
+		for (;;) {
+			sockaddr_in addr;
+			socklen_t addrlen = (socklen_t)sizeof(sockaddr_in);
+			int fd = accept(_fdListen, (sockaddr *)&addr, &addrlen);
+			if (fd < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					// ignore
+				} else {
+					printf("Error accepting socket.\n");
+				}
+				break;
 			} else {
-				printf("Error accepting socket.\n");
+				if (sessions.size() > MAX_CONN) {
+					printf("Max TCP reached.\n");
+					::close(fd);
+				} else {
+					ClientSession *session = new ClientSession(fd);
+					sessions.push_back(session);
+				}
 			}
-		} else {
+		}
+		for (Sessions::iterator it = sessions.begin(); it != sessions.end(); ++it) {
+			if ((*it)->release()) {
 
+			} else {
+				// Write
+				if ((*it)->sendResponses() < 0) {
+					(*it)->setRelease();
+				}
+				if (!(*it)->release()) {
+					if ((*it)->readReq() < 0) {
+						(*it)->setRelease();
+					}
+					if (!(*it)->release()) {
+						while ((*it)->_reqProcessed < (*it)->_reqPos) {
+							NetReq &cur = (*it)->_reqs[(*it)->_reqProcessed % NET_QUEUE_SIZE];
+							(*it)->_reqProcessed++;
+							ClientReq &cr = clientReqs[clientReqPos % CLIENT_REQ_SIZE];
+							cr._session = *it;
+							cr._req = cur;
+							asm volatile("" ::: "memory");
+							clientReqPos++;
+						}
+					}
+				}
+			}
 		}
 	}
 	terminated1 = true;
@@ -218,11 +253,12 @@ static void tickethandler(void *) {
 			curPos++;
 			int seat = -1;
 			register int start = curReq._req._start;
-			register int length = curReq._req._length;
+			register int stop = curReq._req._stop;
+			register int length = stop - start;
 			register int train = curReq._req._train;
 			if (start >= 0 &&
-					length > 0 &&
-					(start + length) <= SEGMENTS &&
+					stop > start &&
+					stop <= SEGMENTS &&
 					train >= 0 &&
 					train < TRAINS) {
 				Ticket *t = trains[train]->allocate(start, length);
@@ -234,6 +270,7 @@ static void tickethandler(void *) {
 				}
 			}
 			curReq._session->sendResponse(curReq._req._reqID, seat);
+
 		}
 	}
 	terminated2 = true;
