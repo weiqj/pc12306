@@ -151,7 +151,7 @@ size_t ClientSession::maxRead() const {
 		} else {
 			available -= 4;
 		}
-		if (ret < available) {
+		if (ret > available) {
 			ret = available;
 		}
 	}
