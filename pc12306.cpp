@@ -146,8 +146,10 @@ size_t ClientSession::maxRead() const {
 		if ((size_t)p < GLOBAL_QUEUE_SIZE) {
 			available = GLOBAL_QUEUE_SIZE - (size_t)p;
 		}
-		if (available < 4) {
+		if (available <= 4) {
 			available = 0;
+		} else {
+			available -= 4;
 		}
 		if (ret < available) {
 			ret = available;
