@@ -6,11 +6,16 @@
  */
 
 #include <sys/time.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/ioctl.h>
+#include <sys/epoll.h>
+#include <signal.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <poll.h>
 #include <vector>
 #include <stdexcept>
 #include "pc12306.h"
@@ -55,7 +60,6 @@ struct SearchOffsets {
 	int32_t		length;
 };
 
-static size_t nSearches = 0;
 typedef vector<SearchOffsets> Offsets;
 static Offsets offsets;
 static TicketPool *ticketPool = NULL;
@@ -63,10 +67,9 @@ static bool volatile terminatePocess = false;
 static bool volatile terminated1 = false;
 static bool volatile terminated2 = false;
 
-#define CLIENT_REQ_SIZE	MAX_CONN*NET_QUEUE_SIZE
-
-static ClientReq			clientReqs[CLIENT_REQ_SIZE];
-static uint64_t volatile	clientReqPos;
+static ClientReq *			clientReqs = NULL;
+static uint64_t volatile	clientReqPos = 0;
+static uint64_t volatile	clientReqProcessed = 0;
 
 static void generateSearchPatterns() {
 	offsets.clear();
@@ -81,11 +84,13 @@ static void generateSearchPatterns() {
 			}
 		}
 	}
-	nSearches = offsets.size();
+	/*
+	size_t nSearches = offsets.size();
 	printf("Total %d\n", (int)nSearches);
 	for (Offsets::iterator it = offsets.begin(); it != offsets.end(); ++it) {
 		printf("%d    %d    %d\n", it->start ,it->length, it->length - it->start);
 	}
+	*/
 }
 
 void TrainTicketMap::initTickets(TicketPool *tp) {
@@ -123,64 +128,46 @@ Ticket *TrainTicketMap::allocate(int start, int length) {
 	return ret;
 }
 
-static TrainTicketMap *trains[TRAINS];
-
-static double getTime() {
-    struct timeval t;
-    struct timezone tzp;
-    gettimeofday(&t, &tzp);
-    return t.tv_sec + t.tv_usec*1e-6;
-}
-
-static void testReserve(int train, int start, int length) {
-	printf("Reserving Start=%d Length=%d\n", start, length);
-	Ticket *t = trains[train]->allocate(start, length);
-	if (NULL != t) {
-		t = trains[train]->reserve(start, length, ticketPool, t);
-		assert(t);
-		printf("Succeed number=%d start=%d length=%d\n", t->_seat, t->_start, t->_length);
-		ticketPool->free(t);
+size_t ClientSession::maxRead() const {
+	size_t ret;
+	size_t sendPos = _respSent / sizeof(NetResp);	// Sent resp messages
+	size_t pending = _reqPos - sendPos;				// Reqs not processed
+	assert(pending <= SESSION_QUEUE_SIZE);
+	size_t available = SESSION_QUEUE_SIZE - pending;	// How many more we can read
+	if (available <= 4) {
+		printf("read stall\n");
+		ret = 0;
 	} else {
-		printf("Failed\n");
+		ret = available - 4;
 	}
-}
-
-static void test1() {
-	for (int i=0; i<SEATS + 2; i++) {
-		testReserve(0, 3, 1);
-		testReserve(0, 0, 3);
-		testReserve(0, 4, 6);
-	}
-}
-
-static void benchmark() {
-	double t1 = getTime();
-	printf("start benchmark\n");
-	for (size_t i=0; i<100000000LL; i++) {
-		int train = rand() % TRAINS;
-		int start = rand() % SEGMENTS;
-		int length = rand() % (SEGMENTS - start);
-		if (length == 0) {
-			length = 1;
+	ssize_t p = (ssize_t)(clientReqPos - clientReqProcessed);
+	if (p > 0) {
+		available = 0;
+		if ((size_t)p < GLOBAL_QUEUE_SIZE) {
+			available = GLOBAL_QUEUE_SIZE - (size_t)p;
 		}
-		assert((start + length) <= SEGMENTS);
-		Ticket *t = trains[train]->allocate(start, length);
-		if (NULL != t) {
-			t = trains[train]->reserve(start, length, ticketPool, t);
-			assert(t);
-			ticketPool->free(t);
+		if (available < 4) {
+			available = 0;
+		}
+		if (ret < available) {
+			ret = available;
 		}
 	}
-	double t2 = getTime();
-	printf("Total time = %f\n", t2 - t1);
+	return ret;
 }
+
+static TrainTicketMap *trains[TRAINS];
 
 static void iohandler(void *) {
 	typedef vector<ClientSession *> Sessions;
-	Sessions sessions;
+	Sessions sessions1;
+	Sessions sessions2;
+
+	Sessions &sessions = sessions1;
+	Sessions &sessionsValid = sessions2;
 	int _fdListen = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
 	if (_fdListen < 0)
-		throw std::runtime_error("SRServerScheduler: Socket");
+		throw std::runtime_error("Socket");
 	int optval = 1;
 	setsockopt(_fdListen, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 	sockaddr_in addr;
@@ -188,55 +175,139 @@ static void iohandler(void *) {
 	addr.sin_addr.s_addr = INADDR_ANY;
 	addr.sin_port = htons(PORT);
 	if (::bind(_fdListen, (const sockaddr *)(&addr), sizeof(sockaddr_in)) < 0)
-		throw std::runtime_error("SRServerScheduler: Bind");
+		throw std::runtime_error("Bind");
 	int flags = fcntl(_fdListen, F_GETFL, 0);
 	fcntl(_fdListen, F_SETFL, flags | O_NONBLOCK);
 	if (listen(_fdListen, 10) < 0)
-		throw std::runtime_error("SRServerScheduler: Listen");
+		throw std::runtime_error("Listen");
+
+	int efdr = epoll_create(MAX_CONN);
+	int efdw = epoll_create(MAX_CONN);
+
+	{
+		epoll_event ev;
+		ev.events = EPOLLIN;
+		ev.data.fd = _fdListen;
+		ev.data.ptr = NULL;
+		epoll_ctl(efdr, EPOLL_CTL_ADD, _fdListen, &ev);
+	}
+	clientReqPos = 0;
+	struct epoll_event events[MAX_CONN];
 	while (!terminatePocess) {
-		for (;;) {
-			sockaddr_in addr;
-			socklen_t addrlen = (socklen_t)sizeof(sockaddr_in);
-			int fd = accept(_fdListen, (sockaddr *)&addr, &addrlen);
-			if (fd < 0) {
-				if (errno == EAGAIN || errno == EWOULDBLOCK) {
-					// ignore
-				} else {
-					printf("Error accepting socket.\n");
-				}
-				break;
-			} else {
-				if (sessions.size() > MAX_CONN) {
-					printf("Max TCP reached.\n");
-					::close(fd);
-				} else {
-					ClientSession *session = new ClientSession(fd);
-					sessions.push_back(session);
+		double curTime = getTime();
+		// Write first
+		for (Sessions::iterator it = sessions.begin(); it != sessions.end(); ++it) {
+			if (!(*it)->release()) {
+				// Write
+				if ((*it)->_canWrite) {
+					if ((*it)->writeResponses() < 0) {
+						(*it)->setRelease();
+					}
 				}
 			}
 		}
+		// Read
+		bool canRead = false;
+		size_t waitingWrite = 0;
+		size_t writePending = 0;
+		sessionsValid.clear();
 		for (Sessions::iterator it = sessions.begin(); it != sessions.end(); ++it) {
-			if ((*it)->release()) {
-
-			} else {
-				// Write
-				if ((*it)->sendResponses() < 0) {
-					(*it)->setRelease();
-				}
-				if (!(*it)->release()) {
-					if ((*it)->readReq() < 0) {
+			if (!(*it)->release()) {
+				if ((*it)->_canRead) {
+					ssize_t res = (*it)->readReq();
+					if (res > 0) {
+						(*it)->_lastRecvTime = curTime;
+					} else if (res < 0) {
 						(*it)->setRelease();
 					}
-					if (!(*it)->release()) {
-						while ((*it)->_reqProcessed < (*it)->_reqPos) {
-							NetReq &cur = (*it)->_reqs[(*it)->_reqProcessed % NET_QUEUE_SIZE];
-							(*it)->_reqProcessed++;
-							ClientReq &cr = clientReqs[clientReqPos % CLIENT_REQ_SIZE];
-							cr._session = *it;
-							cr._req = cur;
-							asm volatile("" ::: "memory");
-							clientReqPos++;
+				}
+				if (!(*it)->release()) {
+					while ((*it)->_reqProcessed < (*it)->_reqPos) {
+						NetReq &cur = (*it)->_reqs[(*it)->_reqProcessed % SESSION_QUEUE_SIZE];
+						(*it)->_reqProcessed++;
+						ClientReq &cr = clientReqs[clientReqPos % GLOBAL_QUEUE_SIZE];
+						cr._session = *it;
+						cr._req = cur;
+						asm volatile("" ::: "memory");
+						clientReqPos++;
+					}
+					if ((curTime - (*it)->_lastRecvTime) > SESSION_TIMEOUT_SECONDS) {
+						printf("Session timeout\n");
+						(*it)->setRelease();
+					}
+				}
+			}
+			if ((*it)->release() && (*it)->_reqPos == (*it)->_respPos) {
+				(*it)->close();
+				delete (*it);
+				printf("Session closed\n");
+			} else {
+				sessionsValid.push_back(*it);
+				if (!(*it)->release()) {
+					canRead |= (*it)->_canRead;
+					size_t respPos = (*it)->_respPos;
+					size_t respSize = respPos * sizeof(NetResp);
+					if (respSize != (*it)->_respSent) {
+						writePending++;
+						if (!(*it)->_canWrite)
+							waitingWrite++;
+					}
+				}
+			}
+		}
+		std::swap(sessions, sessionsValid);
+		if (waitingWrite > 0 && writePending == waitingWrite) {
+			int nfds = epoll_wait(efdw, events, MAX_CONN, 1);
+			for (int i=0; i<nfds; i++) {
+				ClientSession *cur = reinterpret_cast<ClientSession *>(events[i].data.ptr);
+				if (0 != (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))) {
+					cur->setRelease();
+					epoll_ctl(efdr, EPOLL_CTL_DEL, cur->_fd, NULL);
+					epoll_ctl(efdw, EPOLL_CTL_DEL, cur->_fd, NULL);
+				} else {
+					cur->_canWrite = true;
+				}
+			}
+		}
+		if (!canRead) {
+			int nfds = epoll_wait(efdr, events, MAX_CONN, 1);
+			//printf("Read wait\n");
+			for (int i=0; i<nfds; i++) {
+				ClientSession *cur = reinterpret_cast<ClientSession *>(events[i].data.ptr);
+				if (NULL == cur) {
+					sockaddr_in addr;
+					socklen_t addrlen = (socklen_t)sizeof(sockaddr_in);
+					int fd = accept(_fdListen, (sockaddr *)&addr, &addrlen);
+					if (fd < 0) {
+						if (errno == EAGAIN || errno == EWOULDBLOCK) {
+							// ignore
+						} else {
+							printf("Error accepting socket.\n");
 						}
+						break;
+					} else {
+						if (sessions.size() > MAX_CONN) {
+							printf("Max TCP reached.\n");
+							::close(fd);
+						} else {
+							ClientSession *session = new ClientSession(fd);
+							epoll_event ev;
+							ev.events = EPOLLIN | EPOLLET;
+							ev.data.fd = fd;
+							ev.data.ptr = session;
+							epoll_ctl(efdr, EPOLL_CTL_ADD, fd, &ev);
+							ev.events = EPOLLOUT | EPOLLET;
+							epoll_ctl(efdw, EPOLL_CTL_ADD, fd, &ev);
+							sessions.push_back(session);
+						}
+					}
+				} else {
+					if (0 != (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))) {
+						cur->setRelease();
+						epoll_ctl(efdr, EPOLL_CTL_DEL, cur->_fd, NULL);
+						epoll_ctl(efdw, EPOLL_CTL_DEL, cur->_fd, NULL);
+					} else {
+						cur->_canRead = true;
 					}
 				}
 			}
@@ -246,11 +317,9 @@ static void iohandler(void *) {
 }
 
 static void tickethandler(void *) {
-	uint64_t curPos = 0;
 	while (!terminatePocess) {
-		while (curPos < clientReqPos) {
-			ClientReq &curReq = clientReqs[curPos % CLIENT_REQ_SIZE];
-			curPos++;
+		while (clientReqProcessed < clientReqPos) {
+			ClientReq &curReq = clientReqs[clientReqProcessed % GLOBAL_QUEUE_SIZE];
 			int seat = -1;
 			register int start = curReq._req._start;
 			register int stop = curReq._req._stop;
@@ -265,18 +334,25 @@ static void tickethandler(void *) {
 				if (NULL != t) {
 					t = trains[train]->reserve(start, length, ticketPool, t);
 					seat = t->_seat;
-					assert(t);
+					//assert(t);
 					ticketPool->free(t);
 				}
 			}
-			curReq._session->sendResponse(curReq._req._reqID, seat);
-
+			curReq._session->addResponse(
+					curReq._req._reqID,
+					(int64_t)clientReqProcessed,
+					seat);
+			asm volatile("" ::: "memory");
+			clientReqProcessed++;
 		}
 	}
 	terminated2 = true;
 }
 
+static void signal_ignore_handler(int signum){
+}
 int main(int argc, char* argv[]) {
+	signal(SIGPIPE, signal_ignore_handler);
 	ticketPool = new TicketPool();
 	generateSearchPatterns();
 	for (int i=0; i<TRAINS; i++) {
@@ -285,7 +361,17 @@ int main(int argc, char* argv[]) {
 	}
 	//test1();
 	//benchmark();
+	//if (argc > 1) {
+	//	createThreadStd(&clientKB3, argv[1]);
+	//} else {
+	if(mlockall(MCL_CURRENT|MCL_FUTURE) == -1) {
+		perror("mlockall");
+		exit(-2);
+	}
+	clientReqs = new ClientReq[GLOBAL_QUEUE_SIZE];
 	createThreadStd(&iohandler, NULL);
+	createThreadStd(&tickethandler, NULL);
+	//}
 	for (;;) {
 		sleep(1000);
 	}

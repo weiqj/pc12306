@@ -20,24 +20,48 @@
 #include <sys/uio.h>
 #include <errno.h>
 
+#ifndef __x86_64__
+	#error("X64 arch is required!!!")
+#endif
+
+#ifndef SEGMENTS
 #define SEGMENTS			10
+#endif
+#ifndef TRAINS
 #define TRAINS				5000
+#endif
+#ifndef SEATS
 #define SEATS				3000
+#endif
+#ifndef PORT
 #define PORT				12306
+#endif
+#ifndef MAX_CONN
 #define MAX_CONN			500
-#define HEARTBEAT_SECONDS	5
-#define TIMEOUT_SECONDS		7
+#endif
+#ifndef HEARTBEAT_SECONDS
+#define HEARTBEAT_SECONDS			5
+#endif
+#ifndef SESSION_TIMEOUT_SECONDS
+#define SESSION_TIMEOUT_SECONDS		10
+#endif
+#ifndef TARGET_RATE_PER_SECOND
+#define TARGET_RATE_PER_SECOND		2000000
+#endif
+#ifndef TARGET_MAX_LATENCY_SECONDS
+#define TARGET_MAX_LATENCY_SECONDS	3
+#endif
+#ifndef SESSION_QUEUE_SIZE
+#define SESSION_QUEUE_SIZE				(TARGET_RATE_PER_SECOND * TARGET_MAX_LATENCY_SECONDS)
+#endif
+#ifndef GLOBAL_QUEUE_SIZE
+#define GLOBAL_QUEUE_SIZE			(SESSION_QUEUE_SIZE * 5)
+#endif
 
-#define QUEUE_SIZE_IN	1024
-#define NET_QUEUE_SIZE	1024
-
-struct Ticket {
-	int32_t 	_seat;
-	int16_t		_start;
-	int16_t		_length;
-	Ticket *	_next;
-};
-
+#ifdef __GNUC__
+#pragma ms_struct on
+#endif
+#pragma pack(push, 2)
 struct NetReq {
 	int64_t		_reqID;
 	int32_t		_train;		// [0, 5000)
@@ -50,6 +74,28 @@ struct NetResp {
 	int32_t		_respID;
 	int32_t		_seat;
 };
+#pragma pack(pop)
+#ifdef __GNUC__
+#pragma ms_struct reset
+#endif
+
+struct Ticket {
+	int32_t 	_seat;
+	int16_t		_start;
+	int16_t		_length;
+	Ticket *	_next;
+};
+
+inline void clflush(volatile void *p) {
+    asm volatile ("clflush (%0)" :: "r"(p));
+}
+
+inline double getTime() {
+    struct timeval t;
+    struct timezone tzp;
+    gettimeofday(&t, &tzp);
+    return t.tv_sec + t.tv_usec*1e-6;
+}
 
 class TicketPool {
 public:
@@ -124,9 +170,20 @@ private:
 
 class ClientSession {
 public:
-	ClientSession(int fd) : _fd(fd), _release(false), _reqRead(0), _respPos(0), _respSent(0), _reqPos(0), _reqProcessed(0) {
+	ClientSession(int fd) : _fd(fd), _release(false), _reqRead(0), _respSent(0), _respPos(0), _reqPos(0), _reqProcessed(0),
+			_canRead(false), _canWrite(false), _lastRecvTime(getTime()) {
 		int flags = fcntl(_fd, F_GETFL, 0);
 		fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
+		int size = 1024 * 1024 * 128;
+		int err = setsockopt(_fd, SOL_SOCKET, SO_SNDBUF,  &size, sizeof(int));
+		if (err != 0) {
+			printf("Unable to set send buffer size, continuing with default size\n");
+		}
+		size = 1024 * 1024 * 10;
+		err = setsockopt(_fd, SOL_SOCKET, SO_RCVBUF,  &size, sizeof(int));
+		if (err != 0) {
+			printf("Unable to set receive buffer size, continuing with default size\n");
+		}
 		flags = 1;
         setsockopt(_fd,            /* socket affected */
 			IPPROTO_TCP,     /* set option at TCP level */
@@ -142,6 +199,7 @@ public:
 				ret = -1;
 			else {
 				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					_canRead = false;
 					ret = 0;
 				}
 			}
@@ -162,6 +220,7 @@ public:
 				ret = -1;
 			else {
 				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					_canRead = false;
 					ret = 0;
 				}
 			}
@@ -175,6 +234,9 @@ public:
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				ret = 0;
 			}
+		}
+		if (ret == 0) {
+			_canWrite = false;
 		}
 		return ret;
 	}
@@ -193,6 +255,9 @@ public:
 				ret = 0;
 			}
 		}
+		if (ret == 0) {
+			_canWrite = false;
+		}
 		return ret;
 	}
 
@@ -203,69 +268,65 @@ public:
 		}
 	}
 
-	inline void sendResponse(int64_t reqID, int32_t seat) {
+	inline void addResponse(int64_t reqID, int64_t respID, int32_t seat) {
 		size_t p = _respPos;
-		size_t i = p % NET_QUEUE_SIZE;
+		size_t i = p % SESSION_QUEUE_SIZE;
 		_resps[i]._reqID = reqID;
-		_resps[i]._respID = (int32_t)_respPos;
+		_resps[i]._respID = (int32_t)respID;
 		_resps[i]._seat = seat;
 		asm volatile("" ::: "memory");
 		_respPos = p + 1;
 	}
 
-	inline ssize_t sendResponses() {
-		const size_t CAPACITY = sizeof(NetResp) * NET_QUEUE_SIZE;
+	inline ssize_t writeResponses() {
+		const size_t CAPACITY = sizeof(NetResp) * SESSION_QUEUE_SIZE;
 		size_t total = _respPos * sizeof(NetResp);
 		size_t start = _respSent % CAPACITY;
-		size_t end = total % CAPACITY;
 		ssize_t ret = 0;
-		if (start > end) {	// rewind
-			if (end > 0) {
-				ret = write((const uint8_t *)_resps + start, CAPACITY - start,
-						(const uint8_t *)_resps, end);
-			} else {
-				ret = write((const uint8_t *)_resps + start, CAPACITY - start);
+		if (_respPos == _reqPos || ((total - _respSent) > 1400)) {		// MTU = 1500?
+			size_t end = total % CAPACITY;
+			if (start > end) {	// rewind
+				if (end > 0) {
+					ret = write(((const uint8_t *)_resps) + start, CAPACITY - start,
+							(const uint8_t *)_resps, end);
+				} else {
+					ret = write(((const uint8_t *)_resps) + start, CAPACITY - start);
+				}
+			} else if (start < end) {
+				ret = write(((const uint8_t *)_resps) + start, end - start);
 			}
-		} else if (start < end) {
-			ret = write((const uint8_t *)_resps + start, end - start);
-		}
-		if (ret > 0) {
-			_respSent += ret;
+			if (ret > 0) {
+				_respSent += ret;
+			}
 		}
 		return ret;
 	}
 
-	inline size_t canRead() const {
-		size_t sendPos = _respSent / sizeof(NetResp);
-		size_t pending = _reqPos - sendPos;
-		size_t available = NET_QUEUE_SIZE - pending;
-		if (available <= 4) {
-			return 0;
-		} else {
-			return available - 4;
-		}
-	}
+	size_t maxRead() const;
 
 	inline ssize_t readReq() {
-		const size_t CAPACITY = sizeof(NetReq) * NET_QUEUE_SIZE;
-		size_t n = canRead();
-		size_t targetEndBytes = (_reqPos + n) * sizeof(NetReq);
-		size_t start = _reqRead % CAPACITY;
-		size_t end = targetEndBytes % CAPACITY;
+		const size_t CAPACITY = sizeof(NetReq) * SESSION_QUEUE_SIZE;
 		ssize_t ret = 0;
-		if (start > end) {	// rewind
-			if (end > 0) {
-				ret = read((uint8_t *)_reqs + start, CAPACITY - start,
-						(uint8_t *)_reqs, end);
-			} else {
-				ret = read((uint8_t *)_reqs + start, CAPACITY - start);
+		size_t n = maxRead();
+		if (n > 0) {
+			size_t targetEndBytes = (_reqPos + n) * sizeof(NetReq);
+			assert(targetEndBytes > _reqRead);
+			size_t start = _reqRead % CAPACITY;
+			size_t end = targetEndBytes % CAPACITY;
+			if (start > end) {	// rewind
+				if (end > 0) {
+					ret = read(((uint8_t *)_reqs) + start, CAPACITY - start,
+							(uint8_t *)_reqs, end);
+				} else {
+					ret = read(((uint8_t *)_reqs) + start, CAPACITY - start);
+				}
+			} else if (start < end) {
+				ret = read(((uint8_t *)_reqs) + start, end - start);
 			}
-		} else if (start < end) {
-			ret = read((uint8_t *)_reqs + start, end - start);
-		}
-		if (ret > 0) {
-			_reqRead += ret;
-			_reqPos = _reqRead / sizeof(NetReq);
+			if (ret > 0) {
+				_reqRead += ret;
+				_reqPos = _reqRead / sizeof(NetReq);
+			}
 		}
 		return ret;
 	}
@@ -277,17 +338,22 @@ public:
 	inline void setRelease() {
 		_release = true;
 	}
-private:
+public:
 	int 			_fd;
 	bool			_release;
-	NetResp			_resps[NET_QUEUE_SIZE];
+	NetResp			_resps[SESSION_QUEUE_SIZE];
 	size_t			_reqRead;		// Bytes
-	size_t volatile	_respPos;
 	size_t			_respSent;		// Bytes
-public:
+
+	size_t volatile	_respPos;
 	size_t			_reqPos;
 	size_t			_reqProcessed;
-	NetReq			_reqs[NET_QUEUE_SIZE];
+	NetReq			_reqs[SESSION_QUEUE_SIZE];
+
+	bool			_canRead;
+	bool			_canWrite;
+
+	double			_lastRecvTime;
 };
 
 struct ClientReq {
