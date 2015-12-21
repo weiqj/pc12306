@@ -204,6 +204,8 @@ static void iohandler(void *) {
 				if ((*it)->_canWrite) {
 					if ((*it)->writeResponses() < 0) {
 						(*it)->setRelease();
+						epoll_ctl(efdr, EPOLL_CTL_DEL, (*it)->_fd, NULL);
+						epoll_ctl(efdw, EPOLL_CTL_DEL, (*it)->_fd, NULL);
 					}
 				}
 			}
@@ -221,6 +223,8 @@ static void iohandler(void *) {
 						(*it)->_lastRecvTime = curTime;
 					} else if (res < 0) {
 						(*it)->setRelease();
+						epoll_ctl(efdr, EPOLL_CTL_DEL, (*it)->_fd, NULL);
+						epoll_ctl(efdw, EPOLL_CTL_DEL, (*it)->_fd, NULL);
 					}
 				}
 				if (!(*it)->release()) {
@@ -236,6 +240,8 @@ static void iohandler(void *) {
 					if ((curTime - (*it)->_lastRecvTime) > SESSION_TIMEOUT_SECONDS) {
 						printf("Session timeout\n");
 						(*it)->setRelease();
+						epoll_ctl(efdr, EPOLL_CTL_DEL, (*it)->_fd, NULL);
+						epoll_ctl(efdw, EPOLL_CTL_DEL, (*it)->_fd, NULL);
 					}
 				}
 			}
@@ -379,4 +385,4 @@ int main(int argc, char* argv[]) {
 	}
 	return 0;
 }
-
+RoCE
